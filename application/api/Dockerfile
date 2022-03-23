@@ -1,0 +1,28 @@
+FROM mcr.microsoft.com/dotnet/sdk:6.0 as builder
+
+WORKDIR /src
+COPY application/api /src/application/api
+WORKDIR /src/application/api
+
+RUN dotnet publish -c Release -o /app --nologo --no-self-contained
+
+FROM mcr.microsoft.com/dotnet/aspnet:6.0
+
+RUN apt-get update -qq && \ 
+    apt-get install -qq -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN groupadd -r app -g 1000 \
+ && useradd -m -r app -u 1000 -g app -s /usr/sbin/nologin \
+ && chown app:app /app
+
+COPY --from=builder --chown=app:app /app /app
+
+USER 1000
+
+ENV ASPNETCORE_URLS=http://+:8080
+
+ENTRYPOINT ["tini", "--"]
+CMD ["dotnet", "/app/api.dll"]

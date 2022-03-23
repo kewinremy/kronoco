@@ -1,0 +1,112 @@
+variables:
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+  PROJECT_NAME: api
+  PROJECT_VERSION: 2.0.0
+  SAST_ANALYZER_IMAGE_TAG: 3
+
+  APP_PROJECT_ROOT_PATH: "${CI_PROJECT_DIR}/application/api/"
+  TEST_PROJECT_ROOT_PATH: "${CI_PROJECT_DIR}/application/api.test/"
+
+include:
+- template: Security/SAST.gitlab-ci.yml
+- template: Security/SAST-IaC.latest.gitlab-ci.yml
+- template: Security/Secret-Detection.gitlab-ci.yml
+
+services:
+- docker:20.10.12-dind
+
+stages:
+- compile
+- unit-test
+- test
+- build
+- deploy
+
+compile:
+  stage: compile
+  image: mcr.microsoft.com/dotnet/sdk:6.0
+  script: 
+    - |
+      cd ${APP_PROJECT_ROOT_PATH}
+      dotnet build
+
+unit-test:
+  stage: unit-test
+  image: mcr.microsoft.com/dotnet/sdk:6.0
+  script: 
+    - |
+      cd ${TEST_PROJECT_ROOT_PATH}
+      dotnet test
+
+security-code-scan-sast:
+  stage: test
+  before_script:
+    - wget https://dot.net/v1/dotnet-install.sh && bash dotnet-install.sh
+
+publish-docker:
+  stage: build
+  image: docker:20.10.12
+  variables:
+    IMAGE_NAME: ${PROJECT_NAME}
+    IMAGE_TAG: ${PROJECT_VERSION}
+  script:
+  - docker build -f ${APP_PROJECT_ROOT_PATH}/Dockerfile --tag ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}:${IMAGE_TAG} .
+  - docker login --username ${CI_REGISTRY_USER} --password ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  - docker push ${CI_REGISTRY_IMAGE}/${IMAGE_NAME}:${IMAGE_TAG}
+  after_script:
+  - docker logout
+
+publish-helm:
+  stage: build
+  image: kewinremy/gitlab-cd-container:1.0.0
+  variables:
+    HELM_CHART_NAME: ${PROJECT_NAME}
+    HELM_CHART_VERSION: ${PROJECT_VERSION}
+    CHANNEL: "stable"
+  script: 
+  - |
+    # set version
+    cd ${APP_PROJECT_ROOT_PATH}
+    sed -i "s/name:.*/name: ${HELM_CHART_NAME}/" chart/Chart.yaml
+    sed -i "s/version:.*/version: ${HELM_CHART_VERSION}/" chart/Chart.yaml
+    sed -i "s/appVersion:.*/appVersion: ${HELM_CHART_VERSION}/" chart/Chart.yaml
+
+    # package chart
+    helm package chart --version ${PROJECT_VERSION} --app-version ${PROJECT_VERSION} --debug
+
+    # publish package: https://docs.gitlab.com/ee/user/packages/helm_repository/#use-cicd-to-publish-a-helm-package
+    curl --request POST --user gitlab-ci-token:$CI_JOB_TOKEN --form "chart=@${HELM_CHART_NAME}-${PROJECT_VERSION}.tgz" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/${CHANNEL}/charts"
+
+    # cleanup
+    rm -rf "${HELM_CHART_NAME}-${PROJECT_VERSION}.tgz"
+
+deploy:
+  stage: deploy
+  image:
+    name: kewinremy/gitlab-cd-container:2.0.0
+  environment:
+    name: development
+  variables:
+    NAMESPACE: development
+    CHANNEL: stable
+    HELM_REPO_NAME: gitlab
+    HELM_CHART_NAME: ${PROJECT_NAME}
+    HELM_RELEASE_NAME: ${PROJECT_NAME}
+  script:
+  - |
+    # create secret docker registry secret for accessing images from private gitlab repository
+    kubectl create secret docker-registry kronoco-docker -n ${NAMESPACE} \
+    --docker-server=https://${CI_REGISTRY} \
+    --docker-username=${CI_REGISTRY_USER} \
+    --docker-password=${CI_REGISTRY_PASSWORD} \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+    # adding chart repo
+    helm repo add --username gitlab-ci-token --password ${CI_JOB_TOKEN} ${HELM_REPO_NAME} https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/packages/helm/${CHANNEL}
+
+    # install
+    helm upgrade --install ${HELM_RELEASE_NAME} ${HELM_REPO_NAME}/${HELM_CHART_NAME} -n ${NAMESPACE} -f ${APP_PROJECT_ROOT_PATH}/chart/values.yaml
